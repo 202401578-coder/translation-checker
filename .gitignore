@@ -1,0 +1,8 @@
+node_modules/
+.next/
+.model-cache/
+.env*
+*.tsbuildinfo
+.upgrade-backup/
+out/
+.DS_Store
