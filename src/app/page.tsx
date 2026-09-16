@@ -1,48 +1,239 @@
 "use client";
-import { useState, useRef } from "react";
-import { splitSentences, extractSourceSentencesFromMixedText, type SourceLanguage } from "@/lib/sentences";
-import { compareSentenceLists, type ComparisonReport } from "@/lib/compare";
 
-const samples: Record<SourceLanguage, { source: string; translation: string }> = {
-  de: { source: "Heute Morgen bin ich früher als gewöhnlich aufgestanden.\nNach dem Frühstück bin ich mit dem Fahrrad zur Arbeit gefahren.\nAuf dem Weg habe ich einen alten Freund getroffen.\nWir haben uns kurz unterhalten und Telefonnummern ausgetauscht.\nAm Nachmittag musste ich an einer wichtigen Besprechung teilnehmen.", translation: "Heute Morgen bin ich früher als gewöhnlich aufgestanden.\n오늘 아침 나는 평소보다 일찍 일어났다.\n\nNach dem Frühstück bin ich mit dem Fahrrad zur Arbeit gefahren.\n아침 식사 후 자전거를 타고 직장에 갔다.\n\nAuf dem Weg habe ich einen alten Freund getroffen.\n가는 길에 오랜 친구를 만났다.\n\nAm Nachmittag musste ich an einer wichtigen Besprechung teilnehmen.\n오후에는 중요한 회의에 참석해야 했다." },
-  en: { source: "The meeting started at nine.\nEveryone introduced themselves.\nWe discussed the new project.", translation: "The meeting started at nine.\n회의는 아홉 시에 시작했다.\nWe discussed the new project.\n우리는 새 프로젝트에 대해 논의했다." },
-  ja: { source: "今日はいい天気です。\n公園に行きました。\n友達に会いました。", translation: "今日はいい天気です。\n오늘은 날씨가 좋다.\n友達に会いました。\n친구를 만났다." },
-  auto: { source: "The meeting started at nine.\nEveryone introduced themselves.", translation: "The meeting started at nine.\n회의는 아홉 시에 시작했다." },
+import { useEffect, useMemo, useRef, useState } from "react";
+import { segment, type AlignmentRow, type AlignmentStatus, type SplitMode } from "@/lib/alignment";
+import { example } from "@/lib/examples";
+
+const labels: Record<AlignmentStatus, string> = {
+  paired: "대응 후보", review: "의미 확인", missing: "누락 의심",
+  merged: "합쳐짐 의심", split: "나뉨 의심", extra: "추가 의심",
 };
-const statusLabels = { match: "일치", similar: "유사", missing: "누락" };
-const statusColors = { match: "bg-green-50 border-green-500 text-green-700", similar: "bg-yellow-50 border-yellow-400 text-yellow-700", missing: "bg-red-50 border-red-500 text-red-600" };
+type Report = { source: string[]; target: string[]; rows: AlignmentRow[] };
+type Filter = "all" | "review" | "pending";
+
 export default function Home() {
   const [source, setSource] = useState("");
-  const [translation, setTranslation] = useState("");
-  const [language, setLanguage] = useState<SourceLanguage>("de");
-  const [report, setReport] = useState<ComparisonReport | null>(null);
-  const [extracted, setExtracted] = useState<string[]>([]);
+  const [target, setTarget] = useState("");
+  const [language, setLanguage] = useState("de");
+  const [mode, setMode] = useState<SplitMode>("sentence");
+  const [report, setReport] = useState<Report | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState({ message: "분석 모델을 준비하고 있어요.", percent: undefined as number | undefined });
+  const workerRef = useRef<Worker | null>(null);
+  useEffect(() => () => workerRef.current?.terminate(), []);
   const [error, setError] = useState("");
+  const [filter, setFilter] = useState<Filter>("all");
+  const [confirmed, setConfirmed] = useState<Set<number>>(new Set());
+  const [study, setStudy] = useState(false);
+  const [revealed, setRevealed] = useState<Set<number>>(new Set());
+  const [preview, setPreview] = useState(false);
   const [copied, setCopied] = useState(false);
-  const resultRef = useRef<HTMLDivElement>(null);
-  function compare() {
-    setError(""); setCopied(false);
-    const src = splitSentences(source, language), ext = extractSourceSentencesFromMixedText(translation, language);
-    if (!ext.length) { setReport(null); setError("번역 결과에서 원문을 찾지 못했습니다. 오른쪽에는 원문과 한국어 번역이 함께 있는 텍스트를 넣어 주세요. 한국어 번역만으로는 비교할 수 없습니다."); return; }
-    if (src.length > 500 || ext.length > 500) { setError("한 번에 500문장 이하로 나누어 비교해 주세요."); return; }
-    setExtracted(ext); setReport(compareSentenceLists(src, ext));
-    setTimeout(() => resultRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+  const resultsRef = useRef<HTMLElement>(null);
+  const src = useMemo(() => segment(source, language, mode), [source, language, mode]);
+  const tgt = useMemo(() => segment(target, "ko", mode), [target, mode]);
+  const tooLarge = src.length > 100 || tgt.length > 100 || source.length + target.length > 30000;
+  const invalidate = () => {
+    setReport(null); setError(""); setConfirmed(new Set()); setRevealed(new Set()); setCopied(false);
+  };
+  const toggle = (id: number, current: Set<number>, update: (s: Set<number>) => void) => {
+    const next = new Set(current);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    update(next);
+  };
+  function loadExample(kind: string) {
+    invalidate(); setLanguage("de"); setMode("sentence");
+    const data = example(kind); setSource(data.source); setTarget(data.target);
   }
-  async function upload(file: File | undefined, update: (text: string) => void) {
+  function analyze() {
+    setBusy(true); invalidate(); setFilter("all");
+    setProgress({ message: "분석 모델을 준비하고 있어요.", percent: undefined });
+    try {
+      if (!workerRef.current) workerRef.current = new Worker(new URL("../workers/alignment.worker.ts", import.meta.url), { type: "module" });
+      const worker = workerRef.current;
+      worker.onmessage = ({ data }) => {
+        if (data.type === "progress") setProgress({ message: data.message, percent: data.percent });
+        if (data.type === "result") {
+          setReport(data.report); setBusy(false);
+          setTimeout(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100);
+        }
+        if (data.type === "error") {
+          setError(data.message); setBusy(false); worker.terminate(); workerRef.current = null;
+        }
+      };
+      worker.onerror = () => {
+        setError("분석기를 실행하지 못했습니다. 최신 브라우저에서 새로고침한 뒤 다시 시도해 주세요.");
+        setBusy(false); worker.terminate(); workerRef.current = null;
+      };
+      worker.postMessage({ source, target, language, mode });
+    } catch { setError("이 브라우저에서는 분석기를 실행할 수 없습니다. 최신 브라우저에서 다시 시도해 주세요."); setBusy(false); }
+  }
+  async function upload(file: File | undefined, side: "source" | "target") {
     if (!file) return;
-    if (file.size > 1000000) { setError("1MB 이하의 텍스트 파일을 선택해 주세요."); return; }
-    try { update(await file.text()); setReport(null); setError(""); } catch { setError("파일을 읽을 수 없습니다."); }
+    if (file.size > 150000 || !/\.(txt|md)$/i.test(file.name)) {
+      setError("150KB 이하의 .txt 또는 .md 파일을 선택해 주세요."); return;
+    }
+    try {
+      const text = await file.text(); invalidate();
+      (side === "source" ? setSource : setTarget)(text);
+    } catch { setError("파일을 읽지 못했습니다. 내용을 직접 붙여넣어 주세요."); }
   }
-  return <main className="max-w-7xl mx-auto px-4 sm:px-6 py-8">
-    <header className="text-center mb-8"><h1 className="text-3xl font-bold mb-2">번역 검증기</h1><p className="text-gray-500">원문과 번역 결과를 비교하여 누락된 원문 문장을 검출합니다</p></header>
-    <div className="mb-5 flex items-center gap-3"><label htmlFor="language" className="text-sm font-medium">원문 언어</label><select id="language" className="border rounded-lg px-3 py-2 bg-white" value={language} onChange={e => { setLanguage(e.target.value as SourceLanguage); setReport(null); }}>{Object.entries({ de: "🇩🇪 독일어 (Deutsch)", en: "🇺🇸 영어 (English)", ja: "🇯🇵 일본어 (日本語)", auto: "🌐 자동 감지" }).map(([k,v]) => <option key={k} value={k}>{v}</option>)}</select></div>
-    <div className="grid md:grid-cols-2 gap-5">{[{id:"source",label:"원문",value:source,update:setSource,hint:"문장을 줄바꿈 또는 단락 단위로 입력하세요."},{id:"translation",label:"번역 결과 (원문 + 한국어 번역 혼합)",value:translation,update:setTranslation,hint:"한국어 줄은 자동으로 제외하고 원문 문장만 추출합니다."}].map(field => <div key={field.id}><div className="flex justify-between items-center gap-2 mb-2"><label htmlFor={field.id} className="font-semibold">{field.label}</label><label className="text-blue-600 text-sm cursor-pointer shrink-0">파일 업로드<input className="sr-only" type="file" accept=".txt,.md" onChange={e => { void upload(e.target.files?.[0],field.update); e.target.value=""; }} /></label></div><textarea id={field.id} value={field.value} spellCheck={false} onChange={e => { field.update(e.target.value); setReport(null); setError(""); }} className="w-full h-72 rounded-xl border border-gray-300 p-4 font-mono text-sm leading-relaxed focus:ring-2 focus:ring-blue-500 focus:outline-none" placeholder={field.id === "source" ? "원문을 입력하세요." : "원문 한 줄\n한국어 번역 한 줄\n\n원문 한 줄\n한국어 번역 한 줄"}/><p className="text-xs text-gray-500 mt-1">{field.hint}</p></div>)}</div>
-    <div className="flex justify-center gap-3 my-6"><button className="border border-gray-300 rounded-lg px-5 py-3 hover:bg-gray-100" onClick={() => { setSource(samples[language].source); setTranslation(samples[language].translation); setReport(null); setError(""); }}>샘플 텍스트 넣기</button><button className="bg-blue-600 text-white font-semibold rounded-lg px-7 py-3 disabled:opacity-40 hover:bg-blue-700" disabled={!source.trim() || !translation.trim()} onClick={compare}>비교하기</button></div>
-    <p className="text-center text-xs text-gray-500">입력한 텍스트는 브라우저 안에서만 처리됩니다. 번역 의미의 정확성을 평가하는 기능은 아닙니다.</p>
-    {error && <p role="alert" className="mt-5 p-4 rounded-lg border border-amber-200 bg-amber-50 text-amber-900">{error}</p>}
-    {report && <div ref={resultRef} className="border-t mt-8 pt-7 scroll-mt-20"><div className="grid grid-cols-3 sm:grid-cols-6 gap-3 mb-6">{[{label:"원문 문장",value:report.totalSource,color:"bg-gray-100"},{label:"추출 문장",value:report.totalExtracted,color:"bg-gray-100"},{label:"일치",value:report.matchCount,color:"bg-green-100 text-green-700"},{label:"유사",value:report.similarCount,color:"bg-yellow-100 text-yellow-700"},{label:"누락",value:report.missingCount,color:"bg-red-100 text-red-600"},{label:"추가",value:report.extraCount,color:"bg-blue-100 text-blue-700"}].map(s => <div key={s.label} className={`rounded-lg p-4 text-center ${s.color}`}><div className="text-3xl font-bold">{s.value}</div><div className="text-sm mt-1">{s.label}</div></div>)}</div>
-    <details className="mb-5 text-sm text-gray-500"><summary className="cursor-pointer">추출된 원문 문장 미리보기 ({extracted.length}개)</summary><ol className="list-decimal pl-6 mt-3 space-y-2">{extracted.map((s,i) => <li key={i}>{s}</li>)}</ol></details>
-    <div className="space-y-3">{report.results.map((r,i) => <article key={i} className={`border-l-4 rounded-r-lg p-4 ${statusColors[r.status]}`}><div className="flex items-center gap-3 mb-2"><span className="text-gray-400 text-xs">{i+1}.</span><span className="text-sm font-semibold">{r.status === "match" ? "✓" : r.status === "missing" ? "✗" : "≈"} {statusLabels[r.status]}</span>{r.orderIssue && <span className="text-purple-700 text-xs">⚠ 순서 불일치</span>}{r.status === "similar" && <span className="text-xs">{Math.round(r.similarity*100)}%</span>}</div><p className="text-gray-800 font-mono text-sm leading-relaxed">{r.sourceSentence}</p>{r.matchedSentence && r.status !== "match" && <p className="text-gray-500 text-sm mt-2">→ {r.matchedSentence}</p>}</article>)}{report.extras.map((e,i) => <article key={`extra-${i}`} className="border-l-4 border-blue-400 bg-blue-50 rounded-r-lg p-4"><span className="text-blue-700 text-sm font-semibold">+ 추가</span><p className="font-mono text-sm mt-2">{e.sentence}</p></article>)}</div>
-    <div className="text-center mt-6"><button className="border rounded-lg px-5 py-2" onClick={async () => { try { await navigator.clipboard.writeText(`번역 검증 결과\n일치: ${report.matchCount}, 유사: ${report.similarCount}, 누락: ${report.missingCount}, 추가: ${report.extraCount}\n\n`+report.results.map((r,i)=>`${i+1}. [${statusLabels[r.status]}] ${r.sourceSentence}`).join("\n")+"\n"+report.extras.map(e=>`[추가] ${e.sentence}`).join("\n")); setCopied(true); } catch { setError("복사 권한을 확인해 주세요."); } }}>{copied ? "복사 완료" : "결과 복사"}</button></div></div>}
+  function exportText() {
+    if (!report) return "";
+    return "문장 사이 · 대응 검토표\n자동 분석은 대응 후보이며 번역의 정확성을 보증하지 않습니다.\n\n" +
+      report.rows.map((r, i) =>
+        "[" + (confirmed.has(i) ? "직접 확인함 · " : "") + labels[r.status] + "]\n" +
+        (r.source.map(k => "원문 " + (k + 1) + ": " + report.source[k]).join("\n") || "대응 원문 없음") + "\n" +
+        (r.target.map(k => "번역 " + (k + 1) + ": " + report.target[k]).join("\n") || "대응 번역 없음")
+      ).join("\n\n");
+  }
+  const concerns = report?.rows.filter(r => r.status !== "paired").length ?? 0;
+  const visible = (r: AlignmentRow, i: number) =>
+    filter === "all" || filter === "review" && r.status !== "paired" || filter === "pending" && !confirmed.has(i);
+
+  return <main className="workspace">
+    <header className="workspace-heading">
+      <div><div className="eyebrow">READ BETWEEN THE LINES</div>
+        <h1>한 문장도, 놓치지 않도록.</h1>
+        <p>원문과 해석을 나란히 놓고, 문장 사이의 연결을 확인하세요.</p>
+      </div>
+      <span className="local-tag"><span aria-hidden /> 브라우저 의미 분석</span>
+    </header>
+
+    <section className="input-workspace" aria-label="검사할 문서 입력">
+      <div className="toolbar">
+        <div className="toolbar-title"><span className="step">01</span> 원문과 번역 준비</div>
+        <div className="example-actions"><span>예시로 시작</span>
+          <button disabled={busy} onClick={() => loadExample("missing")}>한 문장 누락</button>
+          <button disabled={busy} onClick={() => loadExample("merged")}>두 문장 합쳐짐</button>
+          <button disabled={busy} onClick={() => loadExample("complete")}>전체 번역</button>
+        </div>
+      </div>
+      <div className="editors">{(["source", "target"] as const).map(side =>
+        <div className="editor" key={side}>
+          <div className="editor-heading">
+            <label htmlFor={side}>{side === "source" ? "원문" : "한국어 번역"}</label>
+            <div className="editor-tools">
+              {side === "source" ? <select aria-label="원문 언어" value={language} disabled={busy}
+                onChange={e => { invalidate(); setLanguage(e.target.value); }}>
+                <option value="de">독일어 DE</option><option value="en">영어 EN</option>
+                <option value="fr">프랑스어 FR</option><option value="ja">일본어 JA</option>
+                <option value="es">스페인어 ES</option>
+              </select> : <span className="language-label">한국어 KO</span>}
+              <label className="upload">파일 열기<input type="file" accept=".txt,.md" disabled={busy}
+                aria-label={side === "source" ? "원문 파일 열기" : "번역 파일 열기"}
+                onChange={e => { void upload(e.target.files?.[0], side); e.target.value = ""; }} /></label>
+            </div>
+          </div>
+          <textarea id={side} spellCheck={false} disabled={busy} value={side === "source" ? source : target}
+            placeholder={side === "source"
+              ? "독일어 원문을 그대로 붙여넣으세요.\n\nHeute Morgen bin ich früher als gewöhnlich aufgestanden."
+              : "LLM이 번역한 한국어 해석만 붙여넣으세요.\n원문을 섞거나 번호를 맞출 필요 없어요.\n\n오늘 아침 나는 평소보다 일찍 일어났다."}
+            onChange={e => { invalidate(); (side === "source" ? setSource : setTarget)(e.target.value); }} />
+          <div className="editor-footer"><span><b>{(side === "source" ? src : tgt).length}</b> 문장</span>
+            <span>{(side === "source" ? source : target).length.toLocaleString()} 자</span></div>
+        </div>
+      )}</div>
+      <div className="analysis-controls">
+        <div className="split-controls"><label className="mode-label">문장 나누기
+          <select value={mode} disabled={busy} onChange={e => { invalidate(); setMode(e.target.value as SplitMode); }}>
+            <option value="sentence">문장부호 기준</option><option value="line">한 줄을 한 문장으로</option>
+          </select></label>
+          <button className="text-button" onClick={() => setPreview(!preview)} aria-expanded={preview}>
+            {preview ? "문장 목록 접기" : "나눈 문장 확인"}
+          </button>
+        </div>
+        <button className="primary-button" disabled={busy || !src.length || !tgt.length || tooLarge} onClick={analyze}>
+          {busy ? <><span className="spinner" /> 의미 비교 중</> : <>문장 대응 검사 <span aria-hidden>↗</span></>}
+        </button>
+      </div>
+      {preview && <div className="segmentation">{[src, tgt].map((sentences, side) =>
+        <div key={side}><h3>{side === 0 ? "원문" : "번역"} · {sentences.length}문장</h3>
+          <ol>{sentences.map((s, i) => <li key={i}>{s}</li>)}</ol></div>
+      )}</div>}
+    </section>
+
+    <div className="input-note"><span aria-hidden>ⓘ</span>
+      <p>최초 검사 시 약 145MB의 분석 모델을 다운로드합니다. 브라우저가 캐시를 유지하면 다음 검사에 재사용합니다.<br />
+        문장은 이 브라우저 안에서 분석되며, 외부 번역 서비스로 전송되지 않습니다.</p>
+    </div>
+    {tooLarge && <p className="error-panel" role="alert">각 입력은 100문장 이하, 두 입력을 합쳐 30,000자 이내로 나누어 검사해 주세요.</p>}
+    {busy && <div className="loading-panel" role="status"><div className="loading-line" />
+      <strong>{progress.message}</strong>
+      {progress.percent !== undefined && <progress aria-label="분석 진행 상태" max={100} value={progress.percent} style={{ display: "block", width: "min(100%, 360px)", margin: "16px auto" }} />}
+      <p>첫 실행은 다운로드와 준비에 수 분 걸릴 수 있습니다. 기기 성능에 따라 분석 시간이 달라집니다.</p>
+      <button className="secondary-button" style={{ marginTop: 16 }} onClick={() => { workerRef.current?.terminate(); workerRef.current = null; setBusy(false); }}>검사 취소</button>
+    </div>}
+    {error && <div className="error-panel" role="alert">{error}</div>}
+
+    {!report && !busy && <section className="empty-guide">
+      <div className="guide-mark" aria-hidden>1:1</div>
+      <div><h2>문장 수가 같아도, 연결은 다를 수 있어요.</h2>
+        <p>누락된 해석과 하나로 합쳐진 번역을 찾아<br className="desktop-break" /> 원문 순서대로 검토할 수 있게 정리합니다.</p></div>
+      <div className="guide-pills"><span>1 : 0 <small>누락</small></span>
+        <span>2 : 1 <small>합쳐짐</small></span><span>1 : 2 <small>나뉨</small></span></div>
+    </section>}
+
+    {report && <section className="results" ref={resultsRef}>
+      <div className="result-heading">
+        <div><div className="eyebrow">REVIEW YOUR ALIGNMENT</div><h2>문장별 대응 살펴보기</h2></div>
+        <div className="export-actions">
+          <button className="secondary-button" onClick={async () => {
+            try { await navigator.clipboard.writeText(exportText()); setCopied(true); }
+            catch { setError("복사 권한을 확인하거나 검토표를 저장해 주세요."); }
+          }}>{copied ? "복사 완료" : "결과 복사"}</button>
+          <button className="secondary-button" onClick={() => {
+            const url = URL.createObjectURL(new Blob([exportText()], { type: "text/plain;charset=utf-8" }));
+            const a = document.createElement("a"); a.href = url; a.download = "문장사이-검토표.txt";
+            a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+          }}>검토표 저장 ↓</button>
+        </div>
+      </div>
+      <div className="summary-grid">
+        <div><span>원문 → 번역</span><strong>{report.source.length}<small> → </small>{report.target.length}<small> 문장</small></strong></div>
+        <div><span>1:1 대응 후보</span><strong>{report.rows.filter(r => r.status === "paired").length}<small> 쌍</small></strong></div>
+        <div className={concerns ? "attention-stat" : ""}><span>검토할 연결</span><strong>{concerns}<small> 곳</small></strong></div>
+        <div><span>내가 확인한 연결</span><strong>{confirmed.size}<small> / {report.rows.length}</small></strong></div>
+      </div>
+      <div className="analysis-notice">
+        {concerns ? "표시된 부분부터 확인하세요. 누락 뒤의 문장도 의미를 기준으로 다시 연결했습니다." : "모든 문장에서 1:1 대응 후보를 찾았습니다. 해석을 읽으며 최종 확인해 주세요."}
+        <small>자동 분석은 추정입니다. 비슷한 문장, 순서가 바뀐 번역, 세 문장 이상 합쳐진 번역은 잘못 연결될 수 있습니다.</small>
+      </div>
+      <div className="results-toolbar">
+        <div className="filter-tabs">
+          <button aria-pressed={filter === "all"} onClick={() => setFilter("all")}>전체 {report.rows.length}</button>
+          <button aria-pressed={filter === "review"} onClick={() => setFilter("review")}>검토 필요 {concerns}</button>
+          <button aria-pressed={filter === "pending"} onClick={() => setFilter("pending")}>미확인 {report.rows.length - confirmed.size}</button>
+        </div>
+        <label className="study-toggle"><input type="checkbox" checked={study}
+          onChange={e => { setStudy(e.target.checked); setRevealed(new Set()); }} /> 해석 가리고 공부하기</label>
+      </div>
+      <div className="comparison-labels"><span>원문</span><span>대응 관계</span><span>한국어 해석</span></div>
+      <div className="alignment-list">{report.rows.map((row, i) => {
+        if (!visible(row, i)) return null;
+        return <article className={"alignment-row status-" + row.status + (confirmed.has(i) ? " is-confirmed" : "")} key={i}>
+          <div className="sentence-cell original">{row.source.length ? row.source.map(k =>
+            <p key={k}><span className="sentence-number">{String(k + 1).padStart(2, "0")}</span><span>{report.source[k]}</span></p>
+          ) : <p className="absent">대응하는 원문을 찾지 못했어요.</p>}</div>
+          <div className="connection"><span className={"status-chip " + row.status}>{labels[row.status]}</span>
+            <span className="ratio">{row.source.length} <span>:</span> {row.target.length}</span>
+            {row.source.length > 0 && row.target.length > 0 && <small title="의미 유사도이며 번역 정확도나 확률이 아닙니다.">유사도 {row.score.toFixed(2)}</small>}
+          </div>
+          <div className="sentence-cell translation">
+            {study && row.target.length > 0 && !revealed.has(i)
+              ? <button className="reveal-button" onClick={() => toggle(i, revealed, setRevealed)}>해석 보기 <span>↗</span></button>
+              : row.target.length ? row.target.map(k =>
+                <p key={k}><span className="sentence-number">{String(k + 1).padStart(2, "0")}</span><span>{report.target[k]}</span></p>
+              ) : <p className="absent">이 문장에 대응하는 해석을 확인해 주세요.</p>}
+            <button aria-pressed={confirmed.has(i)} className="confirm-button"
+              onClick={() => { toggle(i, confirmed, setConfirmed); setCopied(false); }}>
+              {confirmed.has(i) ? "✓ 직접 확인함" : "○ 확인했어요"}
+            </button>
+          </div>
+        </article>;
+      })}{!report.rows.some(visible) && <p className="no-results">이 조건에 해당하는 연결이 없습니다.</p>}</div>
+    </section>}
+
+    <footer className="workspace-footer"><span>문장 사이 <span className="footer-divider">/</span> 더 꼼꼼한 독해를 위한 작은 도구</span>
+      <span>한 번에 최대 100문장</span></footer>
   </main>;
 }

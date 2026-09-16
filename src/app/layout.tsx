@@ -3,8 +3,8 @@ import "./globals.css";
 import Navbar from "@/components/Navbar";
 
 export const metadata: Metadata = {
-  title: "독일어 학습 도구",
-  description: "번역 누락 비교 · 단어 뜻 확인",
+  title: "문장 사이 — 원문과 해석을 잇다",
+  description: "원문과 한국어 번역의 문장별 대응을 비교하고 누락과 합쳐진 번역을 검토하는 독해 도구",
 };
 
 export default function RootLayout({

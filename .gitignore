@@ -1,5 +1,8 @@
 node_modules/
 .next/
+.next-build/
+.next-static/
+.static-preview/
 .model-cache/
 .env*
 *.tsbuildinfo
